@@ -1,0 +1,17 @@
+# Compiled Object files
+*.o
+*.obj
+
+.DS_Store
+.vscode
+
+# Logs
+*.log
+*.lock
+
+# Executables
+*.exe
+*.out
+*.app
+
+build/
