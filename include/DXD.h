@@ -42,7 +42,7 @@ class DanceDNNF : DancingMatrix {
         }
 
         DanceDNNF(const string& file_path, int from, Logger& l, 
-                       const bool useIG = false, const bool useETT = false, int pool_size = 8, bool debug = false)
+                       const bool useIG = false, const bool useETT = false, int pool_size = 1, bool debug = false)
             : DancingMatrix(file_path, from, useIG, useETT), 
             logger(l), 
             max_threads(pool_size), 
@@ -50,11 +50,10 @@ class DanceDNNF : DancingMatrix {
             num_of_DNNFNodes(0),
             max_depth(1) {
 
-            if(pool_size > 1) {
-                omp_set_num_threads(pool_size); // 设置并行线程数
-            }
-            
-            timer.setTimeBound(TIME_LIMIT_SECONDS);
+            omp_set_num_threads(pool_size); // 设置并行线程数
+            std::cout << "设置并行线程数为: " << pool_size << std::endl;
+
+            timer.setTimeBound(TIME_LIMIT_SECONDS + 30);
         }
 
         ~DanceDNNF() = default;

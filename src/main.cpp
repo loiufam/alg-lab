@@ -46,12 +46,12 @@ int main(int argc, char *argv[]){
                 {
                     if (use_ett) {
                         logger.logLine("启用DXD算法求解: " + filename);
-                        DanceDNNF danceDNNF(input_file, read_mode, logger, false, true, 2, debug);
+                        DanceDNNF danceDNNF(input_file, read_mode, logger, false, true, 1, debug);
                         danceDNNF.startDXD();
                         logger.logLine("DXD算法求解结束: " + filename);
                     } else {
                         logger.logLine("启用DXD算法求解: " + filename);
-                        DanceDNNF danceDNNF(input_file, read_mode, logger, true, false, 2, debug);
+                        DanceDNNF danceDNNF(input_file, read_mode, logger, true, false, 1, debug);
                         danceDNNF.startDXD();
                         logger.logLine("DXD算法求解结束: " + filename);
                     }
