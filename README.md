@@ -51,7 +51,7 @@ directory with the following arguments:
 
 - **`read_mode`**  
   Specifies the input format or reading mode.
-  - Default value: `3`
+  - Default value: `3`for test cases located in the `run_set` directory.
   - Use `1` for test cases located in the `exact_cover_benchmark` directory.
 
 - **`use_ett_or_not`** *(optional)*  
