@@ -1,7 +1,7 @@
 启用DXD算法求解: Aarnet
 开始单线程DXD搜索...
-Time: 4.400792 s
-Solutions: 53067357700
+Time: 0.010869 s
+Solutions: 0
 Max Blocks: 8
-DNNF Size: 864
+DNNF Size: 7
 DXD算法求解结束: Aarnet

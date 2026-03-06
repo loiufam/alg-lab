@@ -36,7 +36,7 @@ make -j
 To run the solver, you can use the script "main" in this
 directory with the following arguments:
 ```bash
-./main <alg_name> <test_case_path> <read_mode> [use_ett_or_not] [thread_num]
+./main <alg_name> <test_case_path> <read_mode> ett [thread_num]
 ```
 
 ## Arguments
@@ -54,10 +54,8 @@ directory with the following arguments:
   - Default value: `3`for test cases located in the `run_set` directory.
   - Use `1` for test cases located in the `exact_cover_benchmark` directory.
 
-- **`use_ett_or_not`** *(optional)*  
-  Indicates whether Euler Tour Trees (ETT) are used for connected component generation.
-  - `ett`: enable ETT-based connected component maintenance.
-  - `no-ett` or omitted: disable ETT and use the default method.
+- **`ett`** 
+  Indicates Euler Tour Trees (ETT) are used for connected component generation.
 
 - **`thread_num`** *(optional)*  
   Specifies the number of threads to be used during execution.  
@@ -66,6 +64,7 @@ directory with the following arguments:
 
 For example:
 ```bash
+./main dxd ../data/runset/Aarnet.txt 3 ett
 ./main mdxd ../data/runset/Aarnet.txt 3 ett 8 # run a benchmark
 ```
 
