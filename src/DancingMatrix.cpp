@@ -484,7 +484,7 @@ void DancingMatrix::DecUpdateCC(const std::set<int>& deletedVertices) {
 
     if (!g) {
         //主线程 / 串行模式下 getGraph() 返回 nullptr
-        std::cerr << "getGraph() returned nullptr in DecUpdateCC\n";
+        // std::cerr << "getGraph() returned nullptr in DecUpdateCC\n";
         return;
     }
 
@@ -617,7 +617,7 @@ void DancingMatrix::IncUpdateCC(const std::set<int>& restoredVertices) {
     auto& comps = getComponents();
     auto* g = getGraph();
     if (!g) {
-        std::cerr << "getGraph() returned nullptr in IncUpdateCC\n";
+        // std::cerr << "getGraph() returned nullptr in IncUpdateCC\n";
         return;
     }
 

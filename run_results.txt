@@ -1,7 +1,7 @@
-启用DXD算法求解: Aarnet
-开始单线程DXD搜索...
-Time: 0.010869 s
-Solutions: 0
-Max Blocks: 8
-DNNF Size: 7
-DXD算法求解结束: Aarnet
+启用多线程DXD算法求解: bell-09
+开始多线程DXD搜索...
+Time: 3.685800 s
+Solutions: 21147
+Max Blocks: 1
+DNNF Size: 511
+多线程DXD算法求解结束: bell-09
