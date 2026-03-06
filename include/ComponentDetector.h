@@ -5,6 +5,7 @@
 
 #include "SplayETT.h"
 #include "Block.h"
+#include "SplayTree.h"
 #include <map>
 #include <set>
 #include <stack>
@@ -19,6 +20,10 @@
 #include <cstdint>
 #include <stdexcept>
 #include <algorithm>
+#include <cassert>
+#include <iostream>
+#include <iomanip>
+#include <functional>
 
 using comps = vector<Block>;
 
@@ -354,5 +359,185 @@ public:
     vector<Block> detect_blocks(const set<int>& block_rows);
 
 };
+
+// 邻接表节点（支持O(1)删除和恢复）
+struct AdjNode {
+    int neighbor;
+    bool deleted;
+    AdjNode* next;
+    
+    AdjNode(int v) : neighbor(v), deleted(false), next(nullptr) {}
+};
+
+struct Vertex {
+    bool     deleted = false;
+    int      compId  = -1;    // 路由键：所属连通分量 ID
+    AdjNode  sentinel{-1};    // 邻接表哨兵头（不存储真实数据）
+};
+
+class Graph;
+
+class SubGraph {
+public:
+    SubGraph(Graph* parent, int compId, std::vector<int> vids)
+        : parent_(parent), compId_(compId), vertexIds_(std::move(vids)) {}
+
+    // ── 元信息 ──────────────────────────────
+    int compId()  const { return compId_; }
+    int size()    const { return (int)vertexIds_.size(); }
+    const std::vector<int>& vertices() const { return vertexIds_; }
+
+    // ── 无锁边/顶点操作（委托给父图内存）──
+    void addEdge    (int u, int v);
+    void deleteEdge (int u, int v);
+    void restoreEdge(int u, int v);
+    bool hasEdge    (int u, int v) const;
+    void deleteVertex(int v);
+    void restoreVertex(int v);
+    bool hasVertex  (int v)        const;
+
+    // neighbors：返回活跃边的邻居
+    std::vector<int> neighbors(int v) const;
+
+    std::vector<int> getAllNeighbors(int v) const;
+
+    void print() const;
+
+private:
+    Graph*           parent_;
+    int              compId_;
+    std::vector<int> vertexIds_;
+};
+
+// Graph —— 主图（持有所有顶点和邻接表内存）
+class Graph {
+public:
+    explicit Graph(int n) : vertices_(n), vertexComp_(n, -1) {}
+
+    ~Graph() {
+        for (auto& v : vertices_) {
+            AdjNode* cur = v.sentinel.next;
+            while (cur) { AdjNode* nxt = cur->next; delete cur; cur = nxt; }
+        }
+    }
+    
+    // ── 顶点操作 ────────────────────────────
+    void addVertex    (int v) { chk(v); vertices_[v].deleted = false; }
+    void deleteVertex (int v) { chk(v); vertices_[v].deleted = true;  }
+    void restoreVertex(int v) { chk(v); vertices_[v].deleted = false; }
+    bool hasVertex    (int v) const { chk(v); return !vertices_[v].deleted; }
+
+    // ── 边操作 ──────────────────────────────
+    void addEdge    (int u, int v) { insertDir(u,v); insertDir(v,u); }
+    void deleteEdge (int u, int v) { markDir(u,v,true);  markDir(v,u,true);  }
+    void restoreEdge(int u, int v) { markDir(u,v,false); markDir(v,u,false); }
+    bool hasEdge    (int u, int v) const {
+        AdjNode* n = findNode(u,v); return n && !n->deleted;
+    }
+
+    std::vector<int> neighbors(int v) const {
+        chk(v);
+        std::vector<int> res;
+        for (AdjNode* c = vertices_[v].sentinel.next; c; c = c->next)
+            if (!c->deleted && !vertices_[c->neighbor].deleted)
+                res.push_back(c->neighbor);
+        return res;
+    }
+
+    int numVertices()   const { return (int)vertices_.size(); }
+    int numComponents() const { return (int)subgraphs_.size(); }
+
+    void registerComponent(int compId,
+                           const std::unordered_set<int>& comp_vertices)
+    {
+        std::vector<int> vids(comp_vertices.begin(), comp_vertices.end());
+        for (int v : vids) {
+            vertexComp_[v]      = compId;
+            vertices_[v].compId = compId;
+        }
+        subgraphs_[compId] = std::make_unique<SubGraph>(
+            this, compId, std::move(vids));
+    }
+
+    SubGraph* subgraphOf(int v) const {
+        chk(v);
+        int cid = vertexComp_[v];
+        if (cid < 0) return nullptr;
+        auto it = subgraphs_.find(cid);
+        return it == subgraphs_.end() ? nullptr : it->second.get();
+    }
+
+    SubGraph* subgraphById(int cid) const {
+        auto it = subgraphs_.find(cid);
+        return it == subgraphs_.end() ? nullptr : it->second.get();
+    }
+
+    void forEachSubgraph(const std::function<void(int, SubGraph*)>& fn) const {
+        for (auto& [cid, sg] : subgraphs_) fn(cid, sg.get());
+    }
+
+    Vertex&       vertex(int v)       { return vertices_[v]; }
+    const Vertex& vertex(int v) const { return vertices_[v]; }
+
+    AdjNode* findNode(int u, int v) const {
+        if (u < 0 || u >= (int)vertices_.size()) {
+            fprintf(stderr, "[ERROR] findNode: u=%d, size=%zu\n", u, vertices_.size());
+            abort(); // 让 ASan 给出更清晰的栈信息
+        }
+        for (AdjNode* c = vertices_[u].sentinel.next; c; c = c->next)
+            if (c->neighbor == v) return c;
+        return nullptr;
+    }
+    
+    std::vector<int> getNeighbors(int v) const;
+    std::vector<int> getAllNeighbors(int v) const;
+    // bool hasEdge(int u, int v) const;
+    int getDegree(int v) const;
+
+    void printGraph() const {
+        std::cout << "── Graph "
+            << " [" << numVertices() << " verts / "
+            << numComponents() << " comps] ──────\n";
+        for (int i = 0; i < numVertices(); ++i) {
+            const auto& vt = vertices_[i];
+            std::cout << "  v" << std::setw(2) << i
+                      << (vt.deleted ? "[D]" : "   ")
+                      << " c" << std::setw(2) << vt.compId << " │ ";
+            
+            for (AdjNode* c = vt.sentinel.next; c; c = c->next) {
+                std::cout << c->neighbor;
+                if (c->deleted) std::cout << "✗";
+                std::cout << " ";
+            }
+            std::cout << "\n";
+        }
+        std::cout << "Components:\n";
+        for (auto& [cid, sg] : subgraphs_) sg->print();
+    }
+
+private:
+    // int numVertices;
+    std::vector<AdjNode*> adjList;  // 每个顶点的邻接表头
+    std::unordered_map<int, std::unordered_map<int, AdjNode*>> edgeMap; // 快速查找边
+
+    std::vector<Vertex>   vertices_;
+    std::vector<int>      vertexComp_;   // 路由表：vertex_id → comp_id  (O(1))
+    std::unordered_map<int, std::unique_ptr<SubGraph>> subgraphs_; // comp_id → SubGraph
+
+    void chk(int v) const { assert(v >= 0 && v < (int)vertices_.size()); }
+
+    void insertDir(int u, int v) {
+        AdjNode* node = findNode(u, v);
+        if (node) { node->deleted = false; return; }
+        AdjNode* n = new AdjNode(v);
+        n->next    = vertices_[u].sentinel.next;
+        vertices_[u].sentinel.next = n;
+    }
+    void markDir(int u, int v, bool del) {
+        AdjNode* node = findNode(u, v);
+        if (node) node->deleted = del;
+    }
+};
+
 
 #endif // COMPONENTDETECTOR_H

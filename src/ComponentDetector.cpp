@@ -20,6 +20,7 @@ ComponentDetector::ComponentDetector(const int n, const int m)
 
 }
 
+
 void ComponentDetector::Initialize(const std::unordered_map<int, std::vector<int>>& col_rows_map) {
     col_to_rows = col_rows_map;
    
@@ -522,3 +523,61 @@ std::vector<Block> ComponentDetector::convertComponentsToBlocks(
     
 //     return blocks;
 // };
+
+
+std::vector<int> Graph::getNeighbors(int v) const {
+    // chk(v);
+    std::vector<int> res;
+    for (AdjNode* c = vertices_[v].sentinel.next; c; c = c->next)
+        if (!c->deleted && !vertices_[c->neighbor].deleted)
+            res.push_back(c->neighbor);
+    return res;
+}
+
+std::vector<int> Graph::getAllNeighbors(int v) const {
+    // chk(v);
+    std::vector<int> res;
+    for (AdjNode* c = vertices_[v].sentinel.next; c; c = c->next)
+        res.push_back(c->neighbor);   // 不检查 deleted，全部返回
+    return res;
+}
+
+int Graph::getDegree(int v) const {
+    return getNeighbors(v).size();
+}
+
+// ─────────────────────────────────────────────
+//  SubGraph 成员实现
+// ─────────────────────────────────────────────
+ void SubGraph::addEdge    (int u, int v) { parent_->addEdge(u, v);     }
+ void SubGraph::deleteEdge (int u, int v) { parent_->deleteEdge(u, v);  }
+ void SubGraph::restoreEdge(int u, int v) { parent_->restoreEdge(u, v); }
+ bool SubGraph::hasEdge    (int u, int v) const { return parent_->hasEdge(u,v); }
+ void SubGraph::deleteVertex(int v)   { parent_->deleteVertex(v);  }
+ void SubGraph::restoreVertex(int v)  { parent_->restoreVertex(v); }
+ bool SubGraph::hasVertex  (int v)    const { return parent_->hasVertex(v); }
+
+ std::vector<int> SubGraph::neighbors(int v) const {
+    return parent_->getNeighbors(v);
+}
+
+ std::vector<int> SubGraph::getAllNeighbors(int v) const {
+    return parent_->getAllNeighbors(v);
+}
+
+ void SubGraph::print() const {
+    std::cout << "  SubGraph[" << compId_ << "] (" << size() << "v): ";
+    for (int v : vertexIds_) {
+        std::cout << "v" << v << "(";
+        bool first = true;
+        for (AdjNode* c = parent_->vertex(v).sentinel.next; c; c = c->next) {
+            if (!c->deleted && parent_->vertex(c->neighbor).compId == compId_) {
+                if (!first) std::cout << ",";
+                std::cout << c->neighbor;
+                first = false;
+            }
+        }
+        std::cout << ") ";
+    }
+    std::cout << "\n";
+}

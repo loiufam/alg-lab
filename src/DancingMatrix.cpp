@@ -1,5 +1,6 @@
 #include "../include/DancingMatrix.h"
 #include "DynamicGraph.cpp"
+thread_local std::unique_ptr<DancingMatrix::ThreadLocalState> DancingMatrix::tlsState = nullptr;
 
 //构造函数
 DancingMatrix::DancingMatrix( int rows, int cols, int** matrix, bool verbose )  
@@ -101,14 +102,6 @@ DancingMatrix::DancingMatrix( const string& file_path, int from, bool useIg , bo
     }  
     ColIndex[0].down = &RowIndex[0]; 
 
-    // if(useETT) {
-    //     DynamicHypergraphCC::Config config;
-    //     config.enable_parallel = true;
-    //     config.enable_persistence = true;
-    //     config.num_threads = 4;
-    //     dynamic_hypergraph_cc = make_unique<DynamicHypergraphCC>(config);
-    // }
-
     dataNodes.reserve(rows * cols / 2);
     int currentRow = 0;
     while (getline(file, line)) {
@@ -139,12 +132,6 @@ DancingMatrix::DancingMatrix( const string& file_path, int from, bool useIg , bo
             // rowCols.push_back(currentCol);
         }
 
-        // 初始化ETT节点
-        // if (useETT) detector->add_row(currentRow);
-        // active_rows.insert(currentRow);
-        // if (useETT) {
-        //     dynamic_hypergraph_cc->addRow(currentRow, rowCols);
-        // }
         currentRow++;
         
         if (currentRow >= rows) break; // 防止超过预期行数
@@ -153,9 +140,11 @@ DancingMatrix::DancingMatrix( const string& file_path, int from, bool useIg , bo
     InitBlock = Block(rowsSet, colsSet);
 
     if(useETT){
-        detector = make_unique<ComponentDetector>(ROWS, COLS); 
-        detector->Initialize(col_to_rows);
-
+        // detector = make_unique<ComponentDetector>(ROWS, COLS); 
+        // detector->Initialize(col_to_rows);
+        graph = make_unique<Graph>(ROWS);
+        initialize();
+        
         cout << "ETT initialization complete." << endl;
     }
 
@@ -169,11 +158,652 @@ DancingMatrix::DancingMatrix( const string& file_path, int from, bool useIg , bo
 
 DancingMatrix::~DancingMatrix() = default;
 
+void DancingMatrix::initialize() {
+    buildGraphFromMatrix();
+    buildSpanningForest();
+}
+
+void DancingMatrix::initThreadLocalState(const Block& block, std::unique_ptr<splaytree::EulerTourTree> tree) {
+    
+    // 创建或重置线程局部状态
+    if (!tlsState) {
+        tlsState = std::make_unique<ThreadLocalState>();
+    }  
+    
+    // 清空旧数据
+    tlsState->components.clear();
+    tlsState->subgraph  = nullptr; 
+    tlsState->nextTreeId = 0;
+
+    if (!tree) { 
+        std::cout << "Warning: Initializing thread local state with an empty tree." << std::endl;
+        tlsState->initialized = true; 
+        return; 
+    }
+    
+    int anyV = tree->getAnyVertex();
+
+    tlsState->components.push_back(std::move(tree));
+    
+    if (anyV >= 0) {
+        tlsState->subgraph = graph->subgraphOf(anyV);
+    }
+    
+    tlsState->initialized = true;
+}
+
+void DancingMatrix::cleanupThreadLocalState() {
+    if (tlsState) {
+        tlsState.reset();
+    }
+}
+
+std::unique_ptr<splaytree::EulerTourTree> DancingMatrix::deepCopyTree(
+    splaytree::EulerTourTree* original) {
+    
+    if (!original) return nullptr;
+    
+    auto newTree = std::make_unique<splaytree::EulerTourTree>(
+        original->getTreeId()
+    );
+    
+    // 拷贝顶点集合
+    newTree->setVertices(original->getVertices());
+    
+    // 拷贝非树边集合
+    newTree->setNonTreeEdges(original->getNonTreeEdges());
+    
+    // 收集原树的所有节点
+    std::vector<splaytree::Node*> originalNodes;
+    original->collectNodes(original->getRoot(), originalNodes);
+    
+    if (originalNodes.empty()) {
+        return newTree;
+    }
+    
+    // 创建新节点的副本
+    std::vector<splaytree::Node*> newNodes;
+    newNodes.reserve(originalNodes.size());
+    
+    for (auto* node : originalNodes) {
+        splaytree::Node* newNode;
+        if (node->isEdge()) {
+            newNode = new splaytree::Node(node->u, node->v);
+            newTree->edgeNodes[node->u][node->v] = newNode;
+        } else {
+            newNode = new splaytree::Node(node->u);
+            newTree->edgeNodes[node->u][node->u] = newNode;
+        }
+        newNodes.push_back(newNode);
+    }
+    
+    // 重建平衡的 Splay 树
+    newTree->root = newTree->buildFromNodes(newNodes, 0, newNodes.size() - 1);
+    
+    return newTree;
+}
+
+std::unique_ptr<Graph> DancingMatrix::deepCopyGraph(splaytree::EulerTourTree* tree) {
+    
+    auto newGraph = std::make_unique<Graph>(ROWS);
+    if (!tree) return newGraph;
+    
+    const auto& nonTreeEdges = tree->getNonTreeEdges();
+    for (const auto& edge : nonTreeEdges) {
+        newGraph->addEdge(edge.u, edge.v);
+    }
+
+    std::vector<splaytree::Node*> nodes;
+    tree->collectNodes(tree->getRoot(), nodes);
+    
+    for (auto* node : nodes) {
+        if (node->isEdge()) { // isEdge() 意味着 node->v != -1
+            newGraph->addEdge(node->u, node->v);
+        }
+    }
+    
+    return newGraph;
+}
+
+// 将矩阵的行映射为无向图的顶点，构建邻接表存储所有边
+void DancingMatrix::buildGraphFromMatrix() {
+
+    std::vector<std::pair<int, int>> temp_edges;
+
+    for (const auto& [col, rows] : col_to_rows) {
+        if (rows.size() <= 1) continue;
+
+        for (size_t i = 0; i < rows.size(); ++i) {
+            for (size_t j = i + 1; j < rows.size(); ++j) {
+                int u = rows[i];
+                int v = rows[j];
+                
+                // 确保 u < v，将无向边标准化
+                if (u > v) std::swap(u, v);
+                
+                temp_edges.emplace_back(u, v);
+            }
+        }
+    }
+
+    std::sort(temp_edges.begin(), temp_edges.end());
+    
+    auto last = std::unique(temp_edges.begin(), temp_edges.end());
+    
+    temp_edges.erase(last, temp_edges.end());
+
+    for (const auto& edge : temp_edges) {
+        graph->addEdge(edge.first, edge.second);
+    }
+
+    // graph->printGraph();
+}
+
+std::vector<splaytree::Edge> DancingMatrix::bfsSpanningTree(int start, std::unordered_set<int>& visited, std::unordered_set<int>& comp_vertices) {
+    std::vector<splaytree::Edge> treeEdges;
+    std::queue<int> q;
+    q.push(start);
+    visited.insert(start);
+    comp_vertices.insert(start);
+    
+    while (!q.empty()) {
+        int u = q.front();
+        q.pop();
+        
+        for (int v : graph->getNeighbors(u)) {
+            if (!visited.count(v)) {
+                visited.insert(v);
+                comp_vertices.insert(v);
+                treeEdges.push_back(splaytree::Edge(u, v));
+                q.push(v);
+            }
+        }
+    }
+    
+    return treeEdges;
+}
+
+// 由无向图得到初始生成森林，基于生成树构建Euler Tour Trees
+void DancingMatrix::buildSpanningForest() {
+    std::unordered_set<int> visited;
+    
+    for (int i = 0; i < ROWS; i++) {
+        if (visited.count(i)) continue;
+        
+        // BFS构建生成树,得到树边集合及分量顶点集合
+        unordered_set<int> comp_vertices;
+        std::vector<splaytree::Edge> treeEdges = bfsSpanningTree(i, visited, comp_vertices);
+
+        int compId = nextTreeId;
+        graph->registerComponent(compId, comp_vertices);
+        
+        // 为每个顶点创建单独的树
+        std::unordered_map<int, std::unique_ptr<splaytree::EulerTourTree>> vertexTrees;
+        // 映射：顶点 -> 当前所属树的代表顶点
+        std::unordered_map<int, int> vertexToRepresentative;
+
+        for (int v : comp_vertices) {
+            auto vTree = std::make_unique<splaytree::EulerTourTree>(nextTreeId++);
+            vTree->addVertex(v);
+            vertexTrees[v] = std::move(vTree);
+            vertexToRepresentative[v] = v;  // 初始时每个顶点代表自己
+        }
+
+        // 查找顶点当前所属树的代表顶点（带路径压缩）
+        std::function<int(int)> findRepresentative = [&](int v) -> int {
+            if (vertexToRepresentative[v] != v) {
+                vertexToRepresentative[v] = findRepresentative(vertexToRepresentative[v]);
+            }
+            return vertexToRepresentative[v];
+        };
+        
+        // 连接树边，逐步合并树
+        for (const splaytree::Edge& e : treeEdges) {
+            int repU = findRepresentative(e.u);
+            int repV = findRepresentative(e.v);
+            
+            // if (repU == repV) {
+            //     std::cout << "Warning: Edge (" << e.u << ", " << e.v 
+            //               << ") forms a cycle, skipping.\n";
+            //     continue;
+            // }
+            
+            auto& uTree = vertexTrees[repU];
+            auto& vTree = vertexTrees[repV];
+            
+            if (uTree && vTree) {
+                // std::cout << "Linking edge (" << e.u << ", " << e.v << ")\n";
+                uTree->link(e.u, e.v, vTree.get());
+                vertexToRepresentative[repV] = repU;
+                vertexTrees[repV].reset();
+                // std::cout << "  Merged tree " << repV << " into tree " << repU << "\n";
+            }
+        }
+        
+        // 找到最终的树（未被reset的那个）
+        splaytree::EulerTourTree* finalTree = nullptr;
+        int finalRep = -1;
+
+        for (auto& [v, tree] : vertexTrees) {
+            if (tree) {
+                finalTree = tree.get();
+                finalRep = v;
+
+                // 添加非树边
+                std::unordered_set<splaytree::Edge, splaytree::EdgeHash> treeEdgeSet(treeEdges.begin(), treeEdges.end());
+                
+                for (int u : comp_vertices) {
+                    for (int v : graph->getNeighbors(u)) {
+                        // 只处理 u < v 的情况，避免 (u,v) 和 (v,u) 重复计算
+                        // 确认 v 也在当前连通分量中
+                        if (u < v && comp_vertices.count(v)) {
+                            splaytree::Edge candidate(u, v);
+                            
+                            // 3. 如果这条边不是树边，那就是非树边
+                            if (!treeEdgeSet.count(candidate)) {
+                                tree->addNonTreeEdge(candidate);
+                            }
+                        }
+                    }
+                }
+                // 更新vertexToComponent映射
+                // for (int vertex : comp_vertices) {
+                //     vertexToComponent[vertex] = tree.get();
+                // }
+
+                components.push_back(std::move(tree)); // 保存生成的树
+                break;
+            }
+        }
+
+        if (!finalTree) std::cerr << "Error: No final tree found for component starting at vertex " << i << "\n";   
+    }
+}
+
+splaytree::EulerTourTree* DancingMatrix::findEulerTourTree(int v) {
+    auto& comps = getComponents();
+    
+    for (auto& tree : comps) {
+        if (tree && tree->containsVertex(v)) {
+            return tree.get();
+        }
+    }
+    return nullptr;
+}
+
+void DancingMatrix::processBoundaryVertex(int v, splaytree::EulerTourTree* tree, SubGraph* g){
+    // 处理所有相邻边(包含非树边)
+    std::vector<int> neighbors = g->neighbors(v);
+    
+    // 边界顶点：删除所有非树边，无需寻找替代边
+    // std::cout << "Removing boundary vertex " << v << "\n";
+    int treeEdgeNeighbor = tree->getBoundaryVertexTreeNeighbor(v);
+   
+    if (treeEdgeNeighbor < 0) {
+        // 只需删除所有非树边（如果还有的话），然后移除顶点
+        for (int u : neighbors) {
+            splaytree::Edge e(v, u);
+            if (tree->hasNonTreeEdge(e)) tree->removeNonTreeEdge(e);
+            g->deleteEdge(v, u);
+        }
+        tree->removeVertex(v);
+        return;
+    }
+
+    // 删除非树边
+    for (int u : neighbors) {
+        if (u != treeEdgeNeighbor) {
+            splaytree::Edge e(v, u);
+            tree->removeNonTreeEdge(e);
+            g->deleteEdge(v, u);
+        }
+    }
+    
+    // 删除唯一的树边
+    tree->cutBoundary(v, treeEdgeNeighbor);
+    g->deleteEdge(v, treeEdgeNeighbor);
+    
+    // 删除顶点
+    tree->removeVertex(v);
+}
+
+// 减量式更新单连通分量
+void DancingMatrix::DecUpdateCC(const std::set<int>& deletedVertices) {
+
+    if (!isGraphSyncEnabled()) return;
+    if (deletedVertices.empty()) return;
+
+    // std::cout << "DecUpdateCC: Deleting vertices: {";
+    // for (int v : deletedVertices) {
+    //     std::cout << " " << v;
+    // }
+    // std::cout << " }\n";
+
+    auto& comps = getComponents();
+    auto* g = getGraph();
+
+    if (!g) {
+        //主线程 / 串行模式下 getGraph() 返回 nullptr
+        std::cerr << "getGraph() returned nullptr in DecUpdateCC\n";
+        return;
+    }
+
+    std::vector<int> boundaryVertices;
+    std::vector<int> otherVertices;
+
+    // 当前连通分量
+    splaytree::EulerTourTree* current_tree = comps[0].get();
+    if (!current_tree) return;
+
+    for (int v : deletedVertices) {
+        int treeEdgeCount = current_tree->getVertexDegree(v);
+
+        if (treeEdgeCount == 1) {
+            boundaryVertices.push_back(v);
+        } else {
+            otherVertices.push_back(v);
+        }
+    }
+
+    // 先处理边界
+    for (int v : boundaryVertices) {
+        processBoundaryVertex(v, current_tree, g);
+    }
+
+    // 继续在处理剩余的非边界顶点
+    for (int v : otherVertices) {
+
+        // 有可能出现分裂
+        splaytree::EulerTourTree* tree = findEulerTourTree(v);
+        if (!tree) continue; 
+
+        // 处理所有相邻边
+        std::vector<int> neighbors = g->neighbors(v);
+        int currentDegree = tree->getVertexDegree(v);
+
+        if (currentDegree == 0) {
+            // 已完全孤立，直接移除
+            tree->removeVertex(v);
+            continue;
+        }
+        // 原本非边界顶点，可能变成边界顶点
+        if (currentDegree == 1) {
+            // std::cout << "Vertex " << v << " became boundary vertex\n";
+            
+            processBoundaryVertex(v, tree, g);
+            continue;
+        }
+        
+        // 仍是非边界顶点
+        // std::cout << "Removing non-boundary vertex " << v << "\n";
+        
+        // 收集树边邻居和非树边邻居
+        std::vector<int> treeNeighbors;
+        std::vector<int> nonTreeNeighbors;
+        
+        for (int u : neighbors) {
+            if (tree->isTreeEdge(v, u)) {
+                treeNeighbors.push_back(u);
+            } else {
+                nonTreeNeighbors.push_back(u);
+            }
+        }
+        
+        // 删除所有非树边
+        for (int u : nonTreeNeighbors) {
+            splaytree::Edge e(v, u);
+            if (tree->hasNonTreeEdge(e)) {
+                tree->removeNonTreeEdge(e);
+            }
+            g->deleteEdge(v, u);
+        }
+
+        // 删除所有树边
+        for (int u : treeNeighbors) {
+
+            if (!g->hasEdge(v, u)) continue;
+
+            splaytree::EulerTourTree* currentTree = findEulerTourTree(v);
+            if (!currentTree) {
+                std::cout << "Warning: vertex " << v << " disappeared during edge removal\n";
+                break;
+            }
+            
+            // std::cout << "  Cutting edge (" << v << ", " << u << ")\n";
+            
+            auto newTree = currentTree->cutWithReplacement(v, u);
+            if (newTree) {
+                // std::cout << "    -> Split occurred, new component created\n";
+                comps.push_back(std::move(newTree));
+            } else {
+                // std::cout << "    -> Reconnected with replacement edge\n";
+            }
+            
+            g->deleteEdge(v, u);
+            // printComponents();
+        }
+
+        // for (auto& comp : comps) {
+        //     if (comp->containsVertex(v)) {
+        //         comp->removeVertex(v);
+        //     }
+        // }
+        splaytree::EulerTourTree* finalTree = findEulerTourTree(v);
+        if (finalTree) {
+            finalTree->removeVertex(v);
+        }
+    }
+    
+    // 更新连通分量
+    comps.erase(
+        std::remove_if(comps.begin(), comps.end(),
+            [](const std::unique_ptr<splaytree::EulerTourTree>& t) { 
+                return t->isEmpty(); 
+            }),
+        comps.end()
+    );
+
+}
+
+void DancingMatrix::IncUpdateCC(const std::set<int>& restoredVertices) {
+    if (!isGraphSyncEnabled()) return;
+    if (restoredVertices.empty()) return;
+
+    // std::cout << "IncUpdateCC: Restoring vertices: {";
+    // for (int v : restoredVertices) {
+    //     std::cout << " " << v;
+    // }
+    // std::cout << " }\n";
+    auto& comps = getComponents();
+    auto* g = getGraph();
+    if (!g) {
+        std::cerr << "getGraph() returned nullptr in IncUpdateCC\n";
+        return;
+    }
+
+    std::unordered_set<int> restoredSet(restoredVertices.begin(), restoredVertices.end());
+
+    for (int v : restoredVertices) {
+        auto newTree = std::make_unique<splaytree::EulerTourTree>(nextTreeId++);
+        newTree->addVertex(v);
+        comps.push_back(std::move(newTree));
+    }
+    
+    for (int v : restoredVertices) {
+        std::vector<int> neighbors = g->getAllNeighbors(v); 
+
+        for (int u : neighbors) {
+            splaytree::EulerTourTree* treeU = findEulerTourTree(u);
+            if (!treeU) continue;
+
+            if (restoredSet.count(u) && v > u) continue;
+
+            if (!g->hasEdge(v, u)) {
+                g->restoreEdge(v, u);
+            }
+            splaytree::EulerTourTree* treeV = findEulerTourTree(v); 
+            if (!treeV) continue;
+
+            if (treeU != treeV) {
+            // std::cout << "Linking restored edge (" << v << ", " << u << ")\n";
+                treeU->link(u, v, treeV);
+            } else {
+                // std::cout << "Adding non-tree edge (" << v << ", " << u << ")\n";
+                treeU->addNonTreeEdge(splaytree::Edge(v, u));
+            }
+        }
+    }
+    
+    comps.erase(
+        std::remove_if(comps.begin(), comps.end(),
+            [](const std::unique_ptr<splaytree::EulerTourTree>& t) { return t->isEmpty(); }),
+        comps.end()
+    );
+}
+
+std::vector<std::unordered_set<int>> DancingMatrix::getConnectedComponents() const {
+    std::vector<std::unordered_set<int>> result;
+    for (const auto& tree : components) {
+        if (!tree->isEmpty()) {
+            result.push_back(tree->getVertices());
+        }
+    }
+    return result;
+}
+
+void DancingMatrix::printComponents() {
+    auto& comps = getComponents();
+    std::cout << "Number of connected components: " << comps.size() << "\n";
+    int idx = 1;
+    for (const auto& tree : comps) {
+        if (!tree->isEmpty()) {
+            std::cout << "Component " << idx++ << " (Tree ID: " << tree->getTreeId() << "): ";
+            tree->printEulerTour();
+            std::cout << "\n";
+        }
+    }
+    std::cout << "============================" << std::endl;
+}
+
+void DancingMatrix::testDynamicUpdateCC(const std::vector<int>& deletedVertices) {
+    std::cout << "Before Decremental Update:\n";
+    printComponents();
+
+    set<int> deleted_set(deletedVertices.begin(), deletedVertices.end());
+
+    DecUpdateCC(deleted_set);
+
+    std::cout << "After Decremental Update:\n";
+    printComponents();
+
+    IncUpdateCC(deleted_set);
+
+    std::cout << "After Incremental Update:\n";
+    printComponents();
+}
+
+void DancingMatrix::testCutEdge(int u, int v) {
+    
+    splaytree::EulerTourTree* tree = findEulerTourTree(u);
+    if (!tree) {
+        std::cout << "Error: Vertex " << u << " not found in any component.\n";
+        return;
+    }
+    
+    std::cout << "Before cutting edge (" << u << ", " << v << "):\n";
+    tree->printEulerTour();
+    
+    int treeId1 = nextTreeId++;
+    int treeId2 = nextTreeId++;
+
+    // 接收返回值
+    auto [newTree1, newTree2] = tree->cut(u, v, treeId1, treeId2);
+    
+    // 检查是否成功
+    if (!newTree1 || !newTree2) {
+        std::cout << "Error: Failed to cut edge (" << u << ", " << v << ").\n";
+        std::cout << "This edge may not exist or is not a tree edge.\n";
+        return;
+    }
+    
+    std::cout << "Successfully cut edge (" << u << ", " << v << ").\n";
+
+    // ========== 更新 components ==========
+    auto it = std::find_if(components.begin(), components.end(),
+                          [tree](const auto& ptr) { return ptr.get() == tree; });
+    
+    if (it != components.end()) {
+        components.erase(it);  // 这会自动调用 unique_ptr 的析构
+    }
+    
+    splaytree::EulerTourTree* tree1Ptr = newTree1.get();
+    splaytree::EulerTourTree* tree2Ptr = newTree2.get();
+    
+    components.push_back(std::move(newTree1));  // newTree1 现在是 nullptr
+    components.push_back(std::move(newTree2));  // newTree2 现在是 nullptr
+    
+    std::cout << "After cutting edge (" << u << ", " << v << "):\n";
+    printComponents();
+
+    tree1Ptr->link(u, v, tree2Ptr);
+    std::cout << "After linking back edge (" << u << ", " << v << "):\n";
+    tree1Ptr->printEulerTour();
+}
+
 vector<Block> DancingMatrix::getComponentsByIG(const set<int> rows) {
     return incrementalGraph->computeComponentsInRows(rows);
     // return findComponents(rows);
 };
 
+vector<Block> DancingMatrix::getComponentsByETT() {
+    // 使用当前线程的 components
+    auto& comps = getComponents();
+
+    vector<Block> blocks;
+    for (const auto& tree : comps) {
+        unordered_set<int> comp_rows = tree->getVertices();
+        set<int> block_rows(comp_rows.begin(), comp_rows.end());
+        set<int> block_cols;
+
+        for (int r : block_rows) {
+            for (int c : row_to_cols[r]) {
+                block_cols.insert(c);
+            }
+        }
+
+        blocks.emplace_back(block_rows, block_cols);
+    }
+    return blocks;
+};
+
+void DancingMatrix::testReRoot(int v) {
+    
+    splaytree::EulerTourTree* tree = findEulerTourTree(v);
+    if (!tree) {
+        std::cout << "Error: Vertex " << v << " not found in any component.\n";
+        return;
+    }
+    
+    std::cout << "Before rerooting at vertex " << v << ":\n";
+    tree->printEulerTour();
+    
+    tree->reroot(v);
+    
+    std::cout << "After rerooting at vertex " << v << ":\n";
+    tree->printEulerTour();
+}
+
+void DancingMatrix::testSplay(int v) {
+
+    splaytree::EulerTourTree* tree = findEulerTourTree(v);
+
+    if (!tree) {
+        std::cout << "Error: Vertex " << v << " not found in any component.\n";
+        return;
+    }
+    
+    tree->testSplay(v);
+}
 
 //插入元素到双向十字链表中
 void DancingMatrix::insert( int r, int c )  
@@ -375,6 +1005,7 @@ void DancingMatrix::coverInBlock(int c, Block& block, set<int>& removed_rows){
     while( curC != col )  
     {    
         int row_id = curC->row;
+        removed_rows.insert(row_id);
 
         if (isGraphSyncEnabled() && useIG) {
             incrementalGraph->deactivateRow(row_id);
@@ -505,9 +1136,9 @@ ColumnHeader* DancingMatrix::selectOptimalColumn(const set<int>& cols) {
     // if (cols.size() <= HEAP_THRESHOLD) {
     //     return selectColumnByLinear(cols, TARGET_THRESHOLD);
     // }
-    if (single_thread_mode) {
-        return selectColumnByMinHeap(cols, TARGET_THRESHOLD);
-    }
+    // if (single_thread_mode) {
+    //     return selectColumnByMinHeap(cols, TARGET_THRESHOLD);
+    // }
 
     return selectColumnByLinear(cols, TARGET_THRESHOLD);
 }

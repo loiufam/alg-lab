@@ -152,6 +152,7 @@ class DanceDNNF : DancingMatrix {
         Logger& logger;
         bool controlOUTPUT = false;
         
+        int num_of_zddNodes = 0; // 记录生成的ZDD节点数量
         // DNNF相关
         int num_of_DNNFNodes;
         int max_depth;

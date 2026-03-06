@@ -20,6 +20,7 @@ set(COMMON_SOURCES
     src/DXDTime.cpp
     src/ComponentDetector.cpp
     src/DynamicGraph.cpp
+    src/SplayTree.cpp
 )
 
 # Add executable target
